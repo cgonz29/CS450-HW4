@@ -29,14 +29,15 @@ ROOT_SERVERS = ("198.41.0.4",
                 "199.7.83.42",
                 "202.12.27.33")
 
-# Global Cache Structures
-EXACT_CACHE = {}         # (name_str, rdatatype_int) -> dns.message.Message
-DELEGATION_CACHE = {}    # domain_suffix_str -> list of IP addresses
+# Global Caches
+EXACT_CACHE = {}       # (name_str, qtype_int) -> dns.message.Message
+DELEGATION_CACHE = {}  # zone_suffix_str -> list of IP addresses
 
 
 def send_query(target_name: dns.name.Name, qtype: dns.rdata.Rdata, server_ip: str):
     """
-    Sends a DNS query with a 3-second timeout. Catch all exceptions to prevent crashes.
+    Sends a UDP DNS query with a 3-second timeout.
+    Catches all exceptions to prevent stack traces.
     """
     try:
         query = dns.message.make_query(target_name, qtype)
@@ -47,7 +48,7 @@ def send_query(target_name: dns.name.Name, qtype: dns.rdata.Rdata, server_ip: st
 
 def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rdata, servers: list, visited: set) -> dns.message.Message:
     """
-    Recursively queries a list of servers for target_name and qtype.
+    Iterates over available servers for target_name and qtype, recursing down delegations.
     """
     for server_ip in servers:
         if server_ip in visited:
@@ -58,48 +59,44 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
         if response is None:
             continue
 
-        # 1. Answer section present
+        # 1. Direct Answer
         if response.answer:
             return response
 
         # Extract NS records from Authority section
         ns_names = []
+        ns_zone_name = None
         for rrset in response.authority:
             if rrset.rdtype == dns.rdatatype.NS:
+                ns_zone_name = rrset.name.to_text().lower()
                 for rdata in rrset:
                     ns_names.append(rdata.target)
 
         if not ns_names:
             continue
 
-        # Extract Glue IPv4 A records from Additional section
+        # Extract IPv4 Glue Records from Additional section
         glue_ips = []
         for rrset in response.additional:
             if rrset.rdtype == dns.rdatatype.A:
                 for rdata in rrset:
                     glue_ips.append(str(rdata))
 
-        # Update Intermediate Delegation Cache
-        name_str = target_name.to_text().lower()
-        parts = name_str.rstrip('.').split('.')
-        if len(parts) >= 1:
-            # Save delegation for matching subdomains
-            for i in range(len(parts)):
-                sub_suffix = ".".join(parts[i:]) + "."
-                if glue_ips:
-                    if sub_suffix not in DELEGATION_CACHE:
-                        DELEGATION_CACHE[sub_suffix] = []
-                    for g_ip in glue_ips:
-                        if g_ip not in DELEGATION_CACHE[sub_suffix]:
-                            DELEGATION_CACHE[sub_suffix].append(g_ip)
+        # Cache Delegation IPs for the specific zone declared in Authority
+        if ns_zone_name and glue_ips:
+            if ns_zone_name not in DELEGATION_CACHE:
+                DELEGATION_CACHE[ns_zone_name] = []
+            for g_ip in glue_ips:
+                if g_ip not in DELEGATION_CACHE[ns_zone_name]:
+                    DELEGATION_CACHE[ns_zone_name].append(g_ip)
 
-        # If Glue IPs exist, continue recursion with them
+        # Recurse with Glue IPs if present
         if glue_ips:
             res = resolve_domain_with_servers(target_name, qtype, glue_ips, visited)
-            if res and (res.answer or res.rcode() == dns.rcode.NXDOMAIN):
+            if res and res.answer:
                 return res
 
-        # Handle Unglued Nameservers: look up A records for NS hostnames
+        # Handle Unglued Nameservers: resolve NS target IP address via recursive lookup
         for ns_name in ns_names:
             ns_msg = lookup(ns_name, dns.rdatatype.A)
             ns_ips = []
@@ -111,25 +108,25 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
 
             if ns_ips:
                 res = resolve_domain_with_servers(target_name, qtype, ns_ips, visited)
-                if res and (res.answer or res.rcode() == dns.rcode.NXDOMAIN):
+                if res and res.answer:
                     return res
 
-    # Return empty response if unresolved
     return dns.message.make_response(dns.message.make_query(target_name, qtype))
 
 
 def lookup(target_name: dns.name.Name,
            qtype: dns.rdata.Rdata) -> dns.message.Message:
     """
-    Main lookup entry point called by collect_results.
+    Main recursive DNS lookup entry point supporting exact and intermediate caching.
     """
-    cache_key = (target_name.to_text().lower(), int(qtype))
+    name_key = target_name.to_text().lower()
+    cache_key = (name_key, int(qtype))
+
     if cache_key in EXACT_CACHE:
         return EXACT_CACHE[cache_key]
 
-    # Find closest delegation point in DELEGATION_CACHE
-    name_str = target_name.to_text().lower()
-    parts = name_str.rstrip('.').split('.')
+    # Intermediate Caching: Search longest suffix match in DELEGATION_CACHE
+    parts = name_key.rstrip('.').split('.')
     initial_servers = []
 
     for i in range(len(parts)):
@@ -144,8 +141,8 @@ def lookup(target_name: dns.name.Name,
     visited = set()
     response = resolve_domain_with_servers(target_name, qtype, initial_servers, visited)
 
-    # CNAME Restarts logic
-    if response and response.answer:
+    # CNAME Restart logic for non-CNAME queries
+    if response and response.answer and qtype != dns.rdatatype.CNAME:
         cname_target = None
         has_direct_answer = False
 
@@ -156,11 +153,14 @@ def lookup(target_name: dns.name.Name,
                 cname_target = rrset[0].target
 
         if not has_direct_answer and cname_target:
+            # Query target domain for the original record type
             cname_res = lookup(cname_target, qtype)
             if cname_res and cname_res.answer:
-                # Append target records to the CNAME response
-                for rrset in cname_res.answer:
-                    response.answer.append(rrset)
+                # Combine CNAME answer set with final destination records
+                combined = dns.message.make_response(dns.message.make_query(target_name, qtype))
+                combined.answer.extend(response.answer)
+                combined.answer.extend(cname_res.answer)
+                response = combined
 
     EXACT_CACHE[cache_key] = response
     return response
@@ -168,8 +168,7 @@ def lookup(target_name: dns.name.Name,
 
 def collect_results(name: str) -> dict:
     """
-    This function parses final answers into the proper data structure that
-    print_results requires. The main work is done within the `lookup` function.
+    Parses final answers into the proper structure expected by print_results.
     """
     full_response = {}
     target_name = dns.name.from_text(name)
@@ -181,8 +180,8 @@ def collect_results(name: str) -> dict:
     for answers in response.answer:
         for answer in answers:
             if answer.rdtype == dns.rdatatype.CNAME:
-                cnames.append({"name": str(answer), "alias": tmp})
-                tmp = str(answer)
+                cnames.append({"name": str(answer.target), "alias": tmp})
+                tmp = str(answer.target)
 
     # lookup A
     response = lookup(target_name, dns.rdatatype.A)
@@ -223,8 +222,7 @@ def collect_results(name: str) -> dict:
 
 def print_results(results: dict) -> None:
     """
-    take the results of a `lookup` and print them to the screen like the host
-    program would.
+    Prints results to stdout matching the host utility format.
     """
     for rtype, fmt_str in FORMATS:
         for result in results.get(rtype, []):
@@ -232,10 +230,6 @@ def print_results(results: dict) -> None:
 
 
 def main():
-    """
-    if run from the command line, take args and call
-    printresults(lookup(hostname))
-    """
     argument_parser = argparse.ArgumentParser()
     argument_parser.add_argument("name", nargs="+",
                                  help="DNS name(s) to look up")
