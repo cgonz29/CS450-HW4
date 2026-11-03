@@ -150,12 +150,12 @@ def lookup(target_name: dns.name.Name,
         cname_target = None
 
         for rrset in response.answer:
-            if rrset.rdtype == qtype:
-                has_direct_answer = True
-            elif rrset.rdtype == dns.rdatatype.CNAME:
+            if rrset.rdtype == dns.rdatatype.CNAME:
                 cname_target = rrset[0].target
+            elif rrset.rdtype == qtype:
+                has_direct_answer = True
 
-        if not has_direct_answer and cname_target:
+        if cname_target and (qtype == dns.rdatatype.CNAME or not has_direct_answer):
             cname_res = lookup(cname_target, qtype)
             if cname_res and cname_res.answer:
                 combined = dns.message.make_response(dns.message.make_query(target_name, qtype))
