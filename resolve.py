@@ -59,7 +59,7 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
         if response is None:
             continue
 
-        # 1. Direct Answer
+        # 1. Check Answer Section
         if response.answer:
             return response
 
@@ -68,11 +68,14 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
         ns_zone_name = None
         for rrset in response.authority:
             if rrset.rdtype == dns.rdatatype.NS:
-                ns_zone_name = rrset.name.to_text().lower()
+                ns_zone_name = rrset.name.to_text().lower().rstrip('.')
                 for rdata in rrset:
                     ns_names.append(rdata.target)
 
         if not ns_names:
+            # Handle NXDOMAIN or Empty Authority response
+            if response.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.NOERROR):
+                return response
             continue
 
         # Extract IPv4 Glue Records from Additional section
@@ -82,7 +85,7 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
                 for rdata in rrset:
                     glue_ips.append(str(rdata))
 
-        # Cache Delegation IPs for the specific zone declared in Authority
+        # Cache Delegation IPs for the zone
         if ns_zone_name and glue_ips:
             if ns_zone_name not in DELEGATION_CACHE:
                 DELEGATION_CACHE[ns_zone_name] = []
@@ -90,13 +93,13 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
                 if g_ip not in DELEGATION_CACHE[ns_zone_name]:
                     DELEGATION_CACHE[ns_zone_name].append(g_ip)
 
-        # Recurse with Glue IPs if present
+        # Recurse with Glue IPs
         if glue_ips:
             res = resolve_domain_with_servers(target_name, qtype, glue_ips, visited)
-            if res and res.answer:
+            if res and (res.answer or res.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.NOERROR)):
                 return res
 
-        # Handle Unglued Nameservers: resolve NS target IP address via recursive lookup
+        # Handle Unglued Nameservers: resolve NS hostname IP address
         for ns_name in ns_names:
             ns_msg = lookup(ns_name, dns.rdatatype.A)
             ns_ips = []
@@ -108,7 +111,7 @@ def resolve_domain_with_servers(target_name: dns.name.Name, qtype: dns.rdata.Rda
 
             if ns_ips:
                 res = resolve_domain_with_servers(target_name, qtype, ns_ips, visited)
-                if res and res.answer:
+                if res and (res.answer or res.rcode() in (dns.rcode.NXDOMAIN, dns.rcode.NOERROR)):
                     return res
 
     return dns.message.make_response(dns.message.make_query(target_name, qtype))
@@ -119,18 +122,18 @@ def lookup(target_name: dns.name.Name,
     """
     Main recursive DNS lookup entry point supporting exact and intermediate caching.
     """
-    name_key = target_name.to_text().lower()
+    name_key = target_name.to_text().lower().rstrip('.')
     cache_key = (name_key, int(qtype))
 
     if cache_key in EXACT_CACHE:
         return EXACT_CACHE[cache_key]
 
-    # Intermediate Caching: Search longest suffix match in DELEGATION_CACHE
-    parts = name_key.rstrip('.').split('.')
+    # Find longest suffix match in DELEGATION_CACHE
+    parts = name_key.split('.')
     initial_servers = []
 
     for i in range(len(parts)):
-        suffix = ".".join(parts[i:]) + "."
+        suffix = ".".join(parts[i:])
         if suffix in DELEGATION_CACHE:
             initial_servers = list(DELEGATION_CACHE[suffix])
             break
@@ -141,10 +144,10 @@ def lookup(target_name: dns.name.Name,
     visited = set()
     response = resolve_domain_with_servers(target_name, qtype, initial_servers, visited)
 
-    # CNAME Restart logic for non-CNAME queries
-    if response and response.answer and qtype != dns.rdatatype.CNAME:
-        cname_target = None
+    # CNAME Restarts logic: follow CNAME target and collect full answer chain
+    if response and response.answer:
         has_direct_answer = False
+        cname_target = None
 
         for rrset in response.answer:
             if rrset.rdtype == qtype:
@@ -153,11 +156,10 @@ def lookup(target_name: dns.name.Name,
                 cname_target = rrset[0].target
 
         if not has_direct_answer and cname_target:
-            # Query target domain for the original record type
             cname_res = lookup(cname_target, qtype)
             if cname_res and cname_res.answer:
-                # Combine CNAME answer set with final destination records
                 combined = dns.message.make_response(dns.message.make_query(target_name, qtype))
+                # Append initial CNAME answer and target domain's answer records
                 combined.answer.extend(response.answer)
                 combined.answer.extend(cname_res.answer)
                 response = combined
@@ -176,37 +178,41 @@ def collect_results(name: str) -> dict:
     # lookup CNAME
     response = lookup(target_name, dns.rdatatype.CNAME)
     cnames = []
-    tmp = name
-    for answers in response.answer:
-        for answer in answers:
-            if answer.rdtype == dns.rdatatype.CNAME:
-                cnames.append({"name": str(answer.target), "alias": tmp})
-                tmp = str(answer.target)
+    
+    # Track alias chain for full CNAME output (Fixes Test 4)
+    for rrset in response.answer:
+        if rrset.rdtype == dns.rdatatype.CNAME:
+            alias_name = rrset.name.to_text()
+            for rdata in rrset:
+                cnames.append({"name": rdata.target.to_text(), "alias": alias_name})
 
     # lookup A
     response = lookup(target_name, dns.rdatatype.A)
     arecords = []
-    for answers in response.answer:
-        a_name = answers.name
-        for answer in answers:
+    for rrset in response.answer:
+        a_name = rrset.name
+        for answer in rrset:
             if answer.rdtype == 1:  # A record
                 arecords.append({"name": a_name, "address": str(answer)})
+            elif answer.rdtype == dns.rdatatype.CNAME and not cnames:
+                # Append CNAMEs discovered during A record lookup if CNAME query missed them
+                cnames.append({"name": answer.target.to_text(), "alias": a_name.to_text()})
 
     # lookup AAAA
     response = lookup(target_name, dns.rdatatype.AAAA)
     aaaarecords = []
-    for answers in response.answer:
-        aaaa_name = answers.name
-        for answer in answers:
+    for rrset in response.answer:
+        aaaa_name = rrset.name
+        for answer in rrset:
             if answer.rdtype == 28:  # AAAA record
                 aaaarecords.append({"name": aaaa_name, "address": str(answer)})
 
     # lookup MX
     response = lookup(target_name, dns.rdatatype.MX)
     mxrecords = []
-    for answers in response.answer:
-        mx_name = answers.name
-        for answer in answers:
+    for rrset in response.answer:
+        mx_name = rrset.name
+        for answer in rrset:
             if answer.rdtype == 15:  # MX record
                 mxrecords.append({"name": mx_name,
                                   "preference": answer.preference,
