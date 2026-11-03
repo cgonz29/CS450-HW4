@@ -170,54 +170,53 @@ def lookup(target_name: dns.name.Name,
 
 def collect_results(name: str) -> dict:
     """
-    Parses final answers into the proper structure expected by print_results.
+    This function parses final answers into the proper data structure that
+    print_results requires. The main work is done within the `lookup` function.
     """
     full_response = {}
     target_name = dns.name.from_text(name)
 
-    # 1. First perform A record lookup to fetch full CNAME chain and answers
-    a_response = lookup(target_name, dns.rdatatype.A)
-    
+    # lookup CNAME
+    response = lookup(target_name, dns.rdatatype.CNAME)
     cnames = []
+    tmp = name
+    for answers in response.answer:
+        for answer in answers:
+            cnames.append({"name": answer, "alias": tmp})
+            tmp = answer
+
+    # lookup A
+    response = lookup(target_name, dns.rdatatype.A)
     arecords = []
+    for answers in response.answer:
+        a_name = answers.name
+        for answer in answers:
+            if answer.rdtype == 1:  # A record
+                arecords.append({"name": a_name, "address": str(answer)})
+            elif answer.rdtype == dns.rdatatype.CNAME and not cnames:
+                # If CNAME wasn't populated during CNAME query, catch CNAME records from A lookup chain
+                cnames.append({"name": answer.target, "alias": tmp})
+                tmp = answer.target
 
-    # Process all CNAMEs and A records returned in the answer section
-    for rrset in a_response.answer:
-        r_name = rrset.name.to_text().rstrip('.')
-        for answer in rrset:
-            if answer.rdtype == dns.rdatatype.CNAME:
-                cnames.append({"name": answer.target.to_text().rstrip('.'), "alias": r_name})
-            elif answer.rdtype == 1:  # A record
-                arecords.append({"name": r_name, "address": str(answer)})
-
-    # If no CNAMEs were found via A record lookup, check CNAME lookup explicitly
-    if not cnames:
-        cname_response = lookup(target_name, dns.rdatatype.CNAME)
-        for rrset in cname_response.answer:
-            r_name = rrset.name.to_text().rstrip('.')
-            for answer in rrset:
-                if answer.rdtype == dns.rdatatype.CNAME:
-                    cnames.append({"name": answer.target.to_text().rstrip('.'), "alias": r_name})
-
-    # 2. Lookup AAAA records
-    aaaa_response = lookup(target_name, dns.rdatatype.AAAA)
+    # lookup AAAA
+    response = lookup(target_name, dns.rdatatype.AAAA)
     aaaarecords = []
-    for rrset in aaaa_response.answer:
-        aaaa_name = rrset.name.to_text().rstrip('.')
-        for answer in rrset:
+    for answers in response.answer:
+        aaaa_name = answers.name
+        for answer in answers:
             if answer.rdtype == 28:  # AAAA record
                 aaaarecords.append({"name": aaaa_name, "address": str(answer)})
 
-    # 3. Lookup MX records
-    mx_response = lookup(target_name, dns.rdatatype.MX)
+    # lookup MX
+    response = lookup(target_name, dns.rdatatype.MX)
     mxrecords = []
-    for rrset in mx_response.answer:
-        mx_name = rrset.name.to_text().rstrip('.')
-        for answer in rrset:
+    for answers in response.answer:
+        mx_name = answers.name
+        for answer in answers:
             if answer.rdtype == 15:  # MX record
                 mxrecords.append({"name": mx_name,
                                   "preference": answer.preference,
-                                  "exchange": str(answer.exchange).rstrip('.')})
+                                  "exchange": str(answer.exchange)})
 
     full_response["CNAME"] = cnames
     full_response["A"] = arecords
